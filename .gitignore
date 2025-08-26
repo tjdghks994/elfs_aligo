@@ -3,7 +3,7 @@ __pycache__
 .ruff_cache
 
 # configs
-config/*
+# config/*
 !config/defaults.yaml
 
 # IDE configurations
