@@ -44,6 +44,7 @@ def main(config: DictConfig):
         "parallel",
         "optimizer",
         "lr_scheduler",
+        "aligo",
         config.method,
     ]
 

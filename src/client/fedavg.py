@@ -2,6 +2,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from typing import Any
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Subset
@@ -10,6 +11,8 @@ from data.utils.datasets import BaseDataset
 from src.utils.functional import evaluate_model, get_optimal_cuda_device
 from src.utils.metrics import Metrics
 from src.utils.models import DecoupledModel
+from src.utils.aligo_utils import FocalLoss, calculate_normalized_entropy, calculate_interpolation_weight
+
 
 
 class FedAvgClient:
@@ -69,11 +72,82 @@ class FedAvgClient:
         self.testing = False
 
         self.local_epoch = self.args.common.local_epoch
+        # L_Base (Cross-Entropy) 초기화
         self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
+
+        # --- ELFS with ALI-GO 초기화 시작 ---
+        self.beta = 1.0 # 기본 보간 가중치 (L_Base만 사용)
+
+        if self.args.aligo.use_aligo:
+            self._initialize_aligo()
+        # --- ELFS with ALI-GO 초기화 끝 ---
 
         self.eval_results = {}
 
         self.return_diff = return_diff
+
+    def _initialize_aligo(self):
+        """ALI-GO 관련 구성요소를 초기화하고 베타를 사전 계산합니다."""
+        
+        # 1. L_Imb 초기화 (Focal Loss 예시, args를 통해 gamma 설정 가능)
+        gamma = self.args.aligo.focal_gamma
+        self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
+        
+        # 2. 최적화된 파라미터(Theta*) 로드 (Algorithm 1, Prerequisite)
+        # 서버 설정을 통해 args로 전달됨
+        theta1 = self.args.aligo.aligo_theta1
+        theta0 = self.args.aligo.aligo_theta0
+
+        if theta1 is None or theta0 is None:
+            raise ValueError(f"Client {self.client_id}: ALI-GO enabled but theta parameters (aligo_theta1/0) are missing in args.")
+
+        # 3. 로컬 엔트로피 계산 (Algorithm 1, Line 15-16)
+        if not self.dataset.classes:
+             raise ValueError("ALI-GO requires 'num_classes' in args.")
+             
+        all_labels = self._get_all_labels_robust()
+        normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
+
+        # 4. 보간 가중치 계산 (Algorithm 1, Line 18)
+        # Theta와 Entropy가 고정값이므로 Beta도 한 번만 계산하여 최적화
+        self.beta = calculate_interpolation_weight(normalized_entropy, theta1, theta0)
+        
+        # print(f"Client {self.id} Initialized with ALI-GO: H_hat={normalized_entropy:.4f}, Beta={self.beta:.4f}")
+
+    def _get_all_labels_robust(self):
+        """데이터 로더의 데이터셋에서 모든 레이블을 효율적이고 안정적으로 추출합니다."""
+        # dataset = self.trainloader.dataset
+        
+        # 효율적인 접근 시도 (데이터셋 구현체에 따라 다름)
+        if hasattr(self.dataset, 'classes'):
+             labels = self.dataset.classes
+        # elif hasattr(dataset, 'labels'):
+        #      labels = dataset.labels
+        else:
+            # 폴백: 데이터 로더 순회 (느릴 수 있음)
+            print(f"Warning: Iterating DataLoader for Client {self.client_id} to get labels.")
+            labels = []
+            for _, target in self.trainloader:
+                labels.extend(target.cpu().tolist())
+        
+        return np.array(labels)
+
+    def calculate_loss(self, outputs, targets):
+        """
+        손실을 계산합니다. (Algorithm 1, Line 20)
+        이 메소드는 FedProx와 같은 다른 알고리즘에서 super()로 호출되어 쉽게 확장될 수 있습니다.
+        """
+        if self.args.aligo.use_aligo:
+            # Adaptive Loss Interpolation (ALI)
+            # L_i = beta * L_Base + (1 - beta) * L_Imb
+            loss_base = self.criterion(outputs, targets)
+            loss_imb = self.criterion_imb(outputs, targets)
+            loss = self.beta * loss_base + (1 - self.beta) * loss_imb
+        else:
+            # 표준 FedAvg 손실
+            loss = self.criterion(outputs, targets)
+            
+        return loss
 
     def load_data_indices(self):
         """This function is for loading data indices for No.`self.client_id`
@@ -214,7 +288,10 @@ class FedAvgClient:
 
                 x, y = x.to(self.device), y.to(self.device)
                 logit = self.model(x)
-                loss = self.criterion(logit, y)
+
+                loss = self.calculate_loss(logit, y)
+                # loss = self.criterion(logit, y)
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()

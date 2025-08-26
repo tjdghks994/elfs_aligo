@@ -193,6 +193,9 @@ class FedAvgServer:
         if init_trainer:
             self.init_trainer()
 
+        # --- ELFS with ALI-GO 설정 확인 ---
+        self._verify_aligo_configuration()
+
         # create setup for centralized evaluation
         if 0 < self.args.common.test.server.interval <= self.args.common.global_epoch:
             if self.all_model_params_personalized:
@@ -210,6 +213,34 @@ class FedAvgServer:
                 ) = initialize_data_loaders(
                     self.dataset, self.client_data_indices, self.args.common.batch_size
                 )
+                
+    def _verify_aligo_configuration(self):
+        """ALI-GO 관련 설정 상태를 확인하고 로깅합니다. (Algorithm 1, Prerequisite 검증)"""
+        use_aligo = self.args.aligo.use_aligo
+        
+        if use_aligo:
+            print("="*40)
+            print("ELFS with ALI-GO is ENABLED")
+            
+            theta1 = self.args.aligo.aligo_theta1
+            theta0 = self.args.aligo.aligo_theta0
+            
+            if theta1 is not None and theta0 is not None:
+                print(f"Optimized Parameters (Theta* from BO):")
+                print(f"  Theta1 (Steepness): {theta1}")
+                print(f"  Theta0 (Bias): {theta0}")
+            else:
+                # 파라미터 누락 시 에러 발생
+                error_msg = "ERROR: ALI-GO enabled but optimized parameters missing. "
+                error_msg += "Please provide 'aligo_theta1' and 'aligo_theta0' in args."
+                print(error_msg)
+                raise ValueError(error_msg)
+                
+            if not self.dataset.classes:
+                 print("ERROR: 'num_classes' must be specified for ALI-GO.")
+                 raise ValueError("Missing 'num_classes' in args.")
+
+            print("="*40)
 
     def init_model(
         self,

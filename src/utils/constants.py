@@ -94,6 +94,12 @@ DEFAULTS = {
         "save_metrics": True,
         "delete_useless_run": True,
     },
+    "aligo": {
+      "use_aligo": True,
+      "aligo_theta1": 1.0,
+      "aligo_theta0": 0.0,
+      "focal_gamma": 2.0
+    }
 }
 
 
