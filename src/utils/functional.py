@@ -44,6 +44,7 @@ def get_optimal_cuda_device(use_cuda: bool) -> torch.device:
     Returns:
         torch.device: The selected CUDA device.
     """
+    print(f"cuda: {torch.cuda.is_available()}")
     if not torch.cuda.is_available() or not use_cuda:
         return torch.device("cpu")
     pynvml.nvmlInit()

@@ -19,6 +19,8 @@ def calculate_normalized_entropy(labels, num_classes):
         labels = np.array(labels)
         
     counts = np.bincount(labels, minlength=num_classes)
+    # print(f"labels: {len(labels)}, num_classes: {num_classes}")
+    # print(f"bin count: {counts}")
     
     # 2. 확률 계산 (p_i,k)
     probabilities = counts / len(labels)

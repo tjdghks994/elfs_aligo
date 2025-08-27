@@ -103,32 +103,44 @@ class FedAvgClient:
 
         # 3. 로컬 엔트로피 계산 (Algorithm 1, Line 15-16)
         if not self.dataset.classes:
-             raise ValueError("ALI-GO requires 'num_classes' in args.")
-             
-        all_labels = self._get_all_labels_robust()
-        normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
-
-        # 4. 보간 가중치 계산 (Algorithm 1, Line 18)
-        # Theta와 Entropy가 고정값이므로 Beta도 한 번만 계산하여 최적화
-        self.beta = calculate_interpolation_weight(normalized_entropy, theta1, theta0)
+            raise ValueError("ALI-GO requires 'classes' in dataset.")
         
-        # print(f"Client {self.id} Initialized with ALI-GO: H_hat={normalized_entropy:.4f}, Beta={self.beta:.4f}")
+        self.entropy = list()
 
-    def _get_all_labels_robust(self):
+        for idx in range(len(self.data_indices)):
+            all_labels = self._get_all_labels_robust(idx)
+            normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
+            # print(f"client id: {self.client_id}, H_i: {normalized_entropy}")
+
+            # 4. 보간 가중치 계산 (Algorithm 1, Line 18)
+            # Theta와 Entropy가 고정값이므로 Beta도 한 번만 계산하여 최적화
+            beta = calculate_interpolation_weight(normalized_entropy, theta1, theta0)
+
+            self.entropy.append({"beta": beta})
+
+            # print(f"Client {idx} Initialized with ALI-GO: H_hat={normalized_entropy:.4f}, Beta={beta:.4f}")
+
+    def _get_all_labels_robust(self, idx):
         """데이터 로더의 데이터셋에서 모든 레이블을 효율적이고 안정적으로 추출합니다."""
         # dataset = self.trainloader.dataset
         
         # 효율적인 접근 시도 (데이터셋 구현체에 따라 다름)
-        if hasattr(self.dataset, 'classes'):
-             labels = self.dataset.classes
-        # elif hasattr(dataset, 'labels'):
-        #      labels = dataset.labels
-        else:
-            # 폴백: 데이터 로더 순회 (느릴 수 있음)
-            print(f"Warning: Iterating DataLoader for Client {self.client_id} to get labels.")
-            labels = []
-            for _, target in self.trainloader:
-                labels.extend(target.cpu().tolist())
+        # print(f"trainset: {self.trainloader.dataset}")
+        # if hasattr(self.trainloader.dataset.dataset, 'targets') or hasattr(self.valloader.dataset.dataset, 'targets'):
+        #     labels = self.trainloader.dataset.dataset.targets + self.valloader.dataset.dataset.targets
+        # else:
+        #     # 폴백: 데이터 로더 순회 (느릴 수 있음)
+        #     print(f"Warning: Iterating DataLoader for Client {self.client_id} to get labels.")
+
+        self.trainset.indices = self.data_indices[idx]["train"]
+        self.valset.indices = self.data_indices[idx]["val"]
+        self.testset.indices = self.data_indices[idx]["test"]
+
+        labels = []
+        for _, target in self.trainloader:
+            labels.extend(target.cpu().tolist())
+        for _, target in self.valloader:
+            labels.extend(target.cpu().tolist())
         
         return np.array(labels)
 
@@ -140,9 +152,10 @@ class FedAvgClient:
         if self.args.aligo.use_aligo:
             # Adaptive Loss Interpolation (ALI)
             # L_i = beta * L_Base + (1 - beta) * L_Imb
+            beta = self.entropy[self.client_id]["beta"]
             loss_base = self.criterion(outputs, targets)
             loss_imb = self.criterion_imb(outputs, targets)
-            loss = self.beta * loss_base + (1 - self.beta) * loss_imb
+            loss = (1 - beta) * loss_base + beta * loss_imb
         else:
             # 표준 FedAvg 손실
             loss = self.criterion(outputs, targets)

@@ -122,7 +122,7 @@ common:
       # Evaluating in train mode allows to get better batchnorm statistics, but is dependent on the order of the data.
       model_in_train_mode: false
 
-  verbose_gap: 5 # Interval round of displaying clients training performance on terminal.
+  verbose_gap: 10 # Interval round of displaying clients training performance on terminal.
   monitor: null # [null, visdom, tensorboard]
   use_cuda: true # Whether to use cuda for training.
 
@@ -147,7 +147,7 @@ pfedsim:
 
 aligo:
   use_aligo: true
-  aligo_theta1: 1.0
-  aligo_theta0: 0.0
+  aligo_theta1: 9.2
+  aligo_theta0: -4.6
   focal_gamma: 2.0
 
