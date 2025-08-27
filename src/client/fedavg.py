@@ -7,6 +7,14 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Subset
 
+# 베이지안 최적화를 위한 임포트 (scikit-optimize)
+try:
+    from skopt import gp_minimize
+    from skopt.space import Real
+except ImportError:
+    print("Warning: scikit-optimize not installed. Bayesian Optimization will be unavailable.")
+    gp_minimize = None
+
 from data.utils.datasets import BaseDataset
 from src.utils.functional import evaluate_model, get_optimal_cuda_device
 from src.utils.metrics import Metrics
@@ -79,7 +87,28 @@ class FedAvgClient:
         self.beta = 1.0 # 기본 보간 가중치 (L_Base만 사용)
 
         if self.args.aligo.use_aligo:
+            # 1. L_Imb 초기화 (Focal Loss 예시, args를 통해 gamma 설정 가능)
+            gamma = self.args.aligo.focal_gamma
+            self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
+            
+            # 2. 최적화된 파라미터(Theta*) 로드 (Algorithm 1, Prerequisite)
+            # 서버 설정을 통해 args로 전달됨
+            self.theta1 = self.args.aligo.aligo_theta1
+            self.theta0 = self.args.aligo.aligo_theta0
+
+            if self.theta1 is None or self.theta0 is None:
+                raise ValueError(f"Client {self.client_id}: ALI-GO enabled but theta parameters (aligo_theta1/0) are missing in args.")
+
+            # 초기 모델 상태 저장 (BO 시뮬레이션 재시작을 위함 - 매우 중요)
+            self.initial_model_state = deepcopy(self.model.state_dict())
+
+            # set theta1, theta0
+            self.run_bayesian_optimization()
+            print(f"Client {self.client_id} BO Result: Theta1={self.theta1}, Theta0={self.theta0}")
+
+            # set beta for ALI-GO
             self._initialize_aligo()
+
         # --- ELFS with ALI-GO 초기화 끝 ---
 
         self.eval_results = {}
@@ -87,20 +116,6 @@ class FedAvgClient:
         self.return_diff = return_diff
 
     def _initialize_aligo(self):
-        """ALI-GO 관련 구성요소를 초기화하고 베타를 사전 계산합니다."""
-        
-        # 1. L_Imb 초기화 (Focal Loss 예시, args를 통해 gamma 설정 가능)
-        gamma = self.args.aligo.focal_gamma
-        self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
-        
-        # 2. 최적화된 파라미터(Theta*) 로드 (Algorithm 1, Prerequisite)
-        # 서버 설정을 통해 args로 전달됨
-        theta1 = self.args.aligo.aligo_theta1
-        theta0 = self.args.aligo.aligo_theta0
-
-        if theta1 is None or theta0 is None:
-            raise ValueError(f"Client {self.client_id}: ALI-GO enabled but theta parameters (aligo_theta1/0) are missing in args.")
-
         # 3. 로컬 엔트로피 계산 (Algorithm 1, Line 15-16)
         if not self.dataset.classes:
             raise ValueError("ALI-GO requires 'classes' in dataset.")
@@ -114,11 +129,12 @@ class FedAvgClient:
 
             # 4. 보간 가중치 계산 (Algorithm 1, Line 18)
             # Theta와 Entropy가 고정값이므로 Beta도 한 번만 계산하여 최적화
-            beta = calculate_interpolation_weight(normalized_entropy, theta1, theta0)
+            beta = calculate_interpolation_weight(normalized_entropy, self.theta1, self.theta0)
 
-            self.entropy.append({"beta": beta})
+            self.entropy.append({"h_hat": normalized_entropy, "beta": beta})
 
             # print(f"Client {idx} Initialized with ALI-GO: H_hat={normalized_entropy:.4f}, Beta={beta:.4f}")
+
 
     def _get_all_labels_robust(self, idx):
         """데이터 로더의 데이터셋에서 모든 레이블을 효율적이고 안정적으로 추출합니다."""
@@ -143,19 +159,81 @@ class FedAvgClient:
             labels.extend(target.cpu().tolist())
         
         return np.array(labels)
+    
+    def run_bayesian_optimization(self):
+        """BO를 실행하여 최적의 Theta1, Theta0를 찾고 self.args에 저장합니다."""
+        
+        # 1. 탐색 공간 정의 (Section III.D 기반)
+        # Theta1 (Steepness): >= 0 (단조성 보장). 값이 클수록 이진 스위칭에 가까워짐.
+        # Theta0 (Bias): Inflection point(-theta0/theta1)를 결정.
+        # 범위는 실험 환경에 따라 조정될 수 있습니다. (예: T1=[0, 20], T0=[-10, 10])
+        space = [
+            Real(0.0, 20.0, name="theta1"),
+            Real(-10.0, 10.0, name="theta0")
+        ]
+
+        # 2. BO 파라미터 설정 (args를 통해 제어)
+        # aligo_bo_n_calls: 총 평가 횟수 (초기 랜덤 샘플링 포함)
+        n_calls = getattr(self.args, "aligo_bo_n_calls", 20) 
+        # aligo_bo_rounds: 각 평가 시 실행할 FL 시뮬레이션 라운드 수 (효율성을 위해 메인보다 짧게 설정)
+        self.bo_rounds = getattr(self.args, "aligo_bo_rounds", 50)
+
+        print(f"BO Config: n_calls={n_calls}, simulation_rounds={self.bo_rounds}")
+
+        # 3. 최적화 실행 (gp_minimize는 목적 함수의 최소값을 찾음)
+        result = gp_minimize(
+            func=self._bo_objective,
+            dimensions=space,
+            n_calls=n_calls,
+            # 재현성을 위한 랜덤 시드 설정
+            random_state=self.args.seed if hasattr(self.args, 'seed') else 42
+        ) # type: ignore
+
+        # 4. 결과 저장
+        self.theta1 = result.x[0]
+        self.theta0 = result.x[1]
+
+    def _bo_objective(self, params):
+        """
+        BO의 목적 함수(Black-box function). 
+        주어진 Theta 파라미터로 FL 시뮬레이션을 실행하고 최종 정확도를 반환합니다.
+        """
+        theta1, theta0 = params
+        print(f"\n[BO Iteration] Evaluating Theta1={theta1:.4f}, Theta0={theta0:.4f}")
+
+        # 1. 환경 리셋 (매우 중요)
+        # 이전 반복에서 학습된 모델 가중치를 초기화하여 공정한 평가 보장
+        
+        # 2. 클라이언트 파라미터 업데이트
+        # 모든 클라이언트가 새로운 Theta를 사용하여 Beta를 다시 계산하도록 함
+
+        # 3. FL 시뮬레이션 실행
+        accuracy = self.evaluate()
+
+        print(f"[BO Iteration] Result: Accuracy={accuracy['test'].accuracy:.4f}%\n")
+        
+        # 4. 목적 값 반환 (gp_minimize는 최소화하므로 '음수 정확도' 반환)
+        return accuracy['test'].accuracy
 
     def calculate_loss(self, outputs, targets):
         """
         손실을 계산합니다. (Algorithm 1, Line 20)
         이 메소드는 FedProx와 같은 다른 알고리즘에서 super()로 호출되어 쉽게 확장될 수 있습니다.
         """
-        if self.args.aligo.use_aligo:
+        if self.args.aligo.algo == "aligo" and self.args.aligo.use_aligo:
             # Adaptive Loss Interpolation (ALI)
             # L_i = beta * L_Base + (1 - beta) * L_Imb
             beta = self.entropy[self.client_id]["beta"]
             loss_base = self.criterion(outputs, targets)
             loss_imb = self.criterion_imb(outputs, targets)
             loss = (1 - beta) * loss_base + beta * loss_imb
+        elif self.args.aligo.algo == "elfs" and self.args.aligo.use_aligo:
+            if self.entropy[self.client_id]["h_hat"] > self.args.aligo.elfs_threshold:
+                # Cross Entropy
+                loss = self.criterion(outputs, targets)
+            else:
+                # Focal Loss
+                loss = self.criterion_imb(outputs, targets)
         else:
             # 표준 FedAvg 손실
             loss = self.criterion(outputs, targets)

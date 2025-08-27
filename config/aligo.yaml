@@ -3,7 +3,7 @@
 # the defaults can be found in src/utils/constants.py
 
 # The method name must be identical to the file name in src/server/<method>.py
-method: fedavg
+method: fedper
 
 dataset:
   # [mnist, cifar10, cifar100, emnist, fmnist, femnist, medmnist,
@@ -12,7 +12,7 @@ dataset:
   name: cifar10
 
 model:
-  name: lenet5
+  name: lenet5 # [lenet5, res18]
 
   # Whether to use torchvision integrated model weights.
   # Has no effect if model is lenet5, 2nn or fedavgcnn
@@ -79,7 +79,7 @@ common:
   join_ratio: 0.1 # Ratio for (client each round) / (client num in total).
   global_epoch: 100 # Number of global epochs, also called communication round.
   local_epoch: 5 # Number if epochs of client local training.
-  batch_size: 32 # Data batch size for client local training.
+  batch_size: 16 # Data batch size for client local training.
   reset_optimizer_on_global_epoch: true # Whether to reset optimizer on each global epoch.
 
   # The ratio of stragglers (set in [0, 1]).
@@ -147,7 +147,9 @@ pfedsim:
 
 aligo:
   use_aligo: true
+  algo: aligo # [aligo, elfs]
   aligo_theta1: 9.2
   aligo_theta0: -4.6
   focal_gamma: 2.0
+  elfs_threshold: 0.9
 
