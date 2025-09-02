@@ -147,9 +147,9 @@ pfedsim:
 
 aligo:
   use_aligo: true
-  algo: aligo # [aligo, elfs]
+  algo: prob # [aligo, elfs, tripod, prob]
   loss: bs # [focal, dice, ldam, bs] bs == Balanced Softmax
-  aligo_theta1: 5.0
-  aligo_theta0: -3.0
+  aligo_theta1: 6.0
+  aligo_theta0: -3.6
   focal_gamma: 5.0
-  elfs_threshold: 0.8
+  elfs_threshold: 0.6

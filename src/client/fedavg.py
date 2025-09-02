@@ -190,6 +190,7 @@ class FedAvgClient:
             loss_base = self.criterion(outputs, targets)
             loss_imb = self.criterion_imb(outputs, targets)
             loss = self.beta * loss_base + (1-self.beta) * loss_imb
+            # loss = self.entropy[self.client_id] * loss_base + (1-self.entropy[self.client_id]) * loss_imb
         elif self.args.aligo.algo == "elfs" and self.args.aligo.use_aligo:
             if self.entropy[self.client_id] >= self.args.aligo.elfs_threshold:
                 # print(f"[id {self.client_id}] use CE because h_hat {self.entropy[self.client_id]}")
@@ -199,6 +200,28 @@ class FedAvgClient:
                 # Focal Loss
                 # print(f"[id {self.client_id}] use FO  because h_hat {self.entropy[self.client_id]}")
                 loss = self.criterion_imb(outputs, targets)
+        elif self.args.aligo.algo == "tripod" and self.args.aligo.use_aligo:
+            if self.entropy[self.client_id] > 0.6:
+                # print(f"[id {self.client_id}] use CE because h_hat {self.entropy[self.client_id]}")
+                # Cross Entropy
+                loss = self.criterion(outputs, targets)
+            elif 0.3 < self.entropy[self.client_id] <= 0.6:
+                # Balanced Softmaxloss
+                cnl = self.cls_num_list[self.client_id]
+                self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
+                loss = self.criterion_bs(outputs, targets)
+            else:
+                # Focal Loss
+                # print(f"[id {self.client_id}] use FO  because h_hat {self.entropy[self.client_id]}")
+                loss = self.criterion_imb(outputs, targets)
+        elif self.args.aligo.algo == "prob" and self.args.aligo.use_aligo:
+            h_avg = np.mean(self.entropy)
+            if torch.rand(1).item() < h_avg:
+                loss = self.criterion(outputs, targets)
+            else:
+                cnl = self.cls_num_list[self.client_id]
+                self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
+                loss = self.criterion_bs(outputs, targets)
         else:
             # 표준 FedAvg 손실
             loss = self.criterion(outputs, targets)
