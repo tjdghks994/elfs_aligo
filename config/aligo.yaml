@@ -3,7 +3,7 @@
 # the defaults can be found in src/utils/constants.py
 
 # The method name must be identical to the file name in src/server/<method>.py
-method: fedper
+method: fedavg
 
 dataset:
   # [mnist, cifar10, cifar100, emnist, fmnist, femnist, medmnist,
@@ -77,9 +77,9 @@ parallel:
 common:
   seed: 42 # Random seed of the run.
   join_ratio: 0.1 # Ratio for (client each round) / (client num in total).
-  global_epoch: 100 # Number of global epochs, also called communication round.
+  global_epoch: 200 # Number of global epochs, also called communication round.
   local_epoch: 5 # Number if epochs of client local training.
-  batch_size: 16 # Data batch size for client local training.
+  batch_size: 32 # Data batch size for client local training.
   reset_optimizer_on_global_epoch: true # Whether to reset optimizer on each global epoch.
 
   # The ratio of stragglers (set in [0, 1]).
@@ -114,7 +114,7 @@ common:
     # Frequency is set by `server.interval`. Negative value for disabling.
     # NOTE: If clients have personalized model parameters like local buffers or classifiers, centralized evaluation for the global model is disabled.
     server:
-      interval: 10
+      interval: 1
       train: false
       val: false
       test: true
@@ -148,8 +148,8 @@ pfedsim:
 aligo:
   use_aligo: true
   algo: aligo # [aligo, elfs]
-  aligo_theta1: 9.2
-  aligo_theta0: -4.6
-  focal_gamma: 2.0
-  elfs_threshold: 0.9
-
+  loss: bs # [focal, dice, ldam, bs] bs == Balanced Softmax
+  aligo_theta1: 5.0
+  aligo_theta0: -3.0
+  focal_gamma: 5.0
+  elfs_threshold: 0.8

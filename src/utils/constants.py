@@ -97,6 +97,7 @@ DEFAULTS = {
     "aligo": {
       "use_aligo": True,
       "algo": "aligo", # [aligo, elfs]
+      "loss": "focal",
       "aligo_theta1": 1.0,
       "aligo_theta0": 0.0,
       "focal_gamma": 2.0,

@@ -58,7 +58,7 @@ class SCAFFOLDClient(FedAvgClient):
         for _ in range(self.args.common.local_epoch):
             x, y = self.get_data_batch()
             logits = self.model(x)
-            loss = self.criterion(logits, y)
+            loss = self.calculate_loss(logits, y)
             self.optimizer.zero_grad()
             loss.backward()
             for param, c, c_i in zip(

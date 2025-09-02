@@ -34,7 +34,7 @@ class MOONClient(FedAvgClient):
                 z_global = self.global_model.get_last_features(x, detach=True)
                 z_prev = self.prev_model.get_last_features(x, detach=True)
                 logits = self.model.classifier(z_curr)
-                loss_sup = self.criterion(logits, y)
+                loss_sup = self.calculate_loss(logits, y)
                 loss_con = -torch.log(
                     torch.exp(
                         cosine_similarity(z_curr.flatten(1), z_global.flatten(1))

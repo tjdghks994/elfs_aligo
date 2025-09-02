@@ -23,7 +23,7 @@ class FedPerClient(FedAvgClient):
 
                     x, y = x.to(self.device), y.to(self.device)
                     logit = self.model(x)
-                    loss = self.criterion(logit, y)
+                    loss = self.calculate_loss(logit, y)
                     self.optimizer.zero_grad()
                     loss.backward()
                     for name, param in self.model.named_parameters():

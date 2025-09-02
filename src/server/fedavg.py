@@ -42,6 +42,14 @@ from src.utils.logger import Logger
 from src.utils.metrics import Metrics
 from src.utils.models import MODELS, DecoupledModel
 from src.utils.trainer import FLbenchTrainer
+from src.utils.aligo_utils import FocalLoss, calculate_normalized_entropy, calculate_interpolation_weight
+
+try:
+    from skopt import gp_minimize
+    from skopt.space import Real
+except ImportError:
+    print("Warning: scikit-optimize not installed. Bayesian Optimization will be unavailable.")
+    gp_minimize = None
 
 
 class FedAvgServer:
@@ -63,6 +71,7 @@ class FedAvgServer:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.set_device(self.device)
+        print(self.device)
 
         fix_random_seed(self.args.common.seed, use_cuda=self.device.type == "cuda")
 
@@ -186,15 +195,47 @@ class FedAvgServer:
         self.dataset = self.get_dataset()
         self.client_data_indices = self.get_clients_data_indices()
 
+        # --- ELFS with ALI-GO 설정 확인 ---
+        self.theta1 = self.args.aligo.aligo_theta1
+        self.theta0 = self.args.aligo.aligo_theta0
+
+        self._verify_aligo_configuration()
+
+        self.entropy = list()
+
+        for data_idx in self.client_data_indices:
+            labels = []
+            for idx in data_idx['train']:
+                labels.append(self.dataset[idx][1].cpu().tolist())
+            for idx in data_idx['val']:
+                labels.append(self.dataset[idx][1].cpu().tolist())
+               
+            all_labels = np.array(labels)
+            normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
+
+            self.entropy.append(normalized_entropy)
+
+        self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
+
+        gamma = self.args.aligo.focal_gamma
+        self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
+
+        (self.trainloader,
+         self.testloader,
+         self.valloader,
+         _,
+         _,
+         _,
+        ) = initialize_data_loaders(
+            self.dataset, self.client_data_indices, self.args.common.batch_size
+        )
+
         # init trainer
         self.trainer: FLbenchTrainer = None
         if self.client_cls is None or not issubclass(self.client_cls, FedAvgClient):
             raise ValueError(f"{self.client_cls} is not a subclass of {FedAvgClient}.")
         if init_trainer:
             self.init_trainer()
-
-        # --- ELFS with ALI-GO 설정 확인 ---
-        self._verify_aligo_configuration()
 
         # create setup for centralized evaluation
         if 0 < self.args.common.test.server.interval <= self.args.common.global_epoch:
@@ -213,6 +254,84 @@ class FedAvgServer:
                 ) = initialize_data_loaders(
                     self.dataset, self.client_data_indices, self.args.common.batch_size
                 )
+        
+    def run_bayesian_optimization(self):
+        """BO를 실행하여 최적의 Theta1, Theta0를 찾고 self.args에 저장합니다."""
+        
+        # 1. 탐색 공간 정의 (Section III.D 기반)
+        # Theta1 (Steepness): >= 0 (단조성 보장). 값이 클수록 이진 스위칭에 가까워짐.
+        # Theta0 (Bias): Inflection point(-theta0/theta1)를 결정.
+        # 범위는 실험 환경에 따라 조정될 수 있습니다. (예: T1=[0, 20], T0=[-10, 10])
+        space = [
+            Real(0.0, 20.0, name="theta1"),
+            Real(-10.0, 10.0, name="theta0")
+        ]
+
+        # 2. BO 파라미터 설정 (args를 통해 제어)
+        # aligo_bo_n_calls: 총 평가 횟수 (초기 랜덤 샘플링 포함)
+        n_calls = getattr(self.args, "aligo_bo_n_calls", 50) 
+        # aligo_bo_rounds: 각 평가 시 실행할 FL 시뮬레이션 라운드 수 (효율성을 위해 메인보다 짧게 설정)
+        # self.bo_rounds = getattr(self.args, "aligo_bo_rounds", 5)
+
+        # print(f"BO Config: n_calls={n_calls}, simulation_rounds={self.bo_rounds}")
+
+        # 3. 최적화 실행 (gp_minimize는 목적 함수의 최소값을 찾음)
+        result = gp_minimize(
+            func=self._bo_objective,
+            dimensions=space,
+            n_calls=n_calls,
+            # 재현성을 위한 랜덤 시드 설정
+            random_state=self.args.common.seed,
+        ) # type: ignore
+
+        # 4. 결과 저장
+        # print(f"[BO result] {result}")
+        return result.x
+        # self.theta1 = result.x[0]
+        # self.theta0 = result.x[1]
+        # print(f"[{self.client_id}] theta1: {self.theta1}, theta0: {self.theta0}")
+
+    def _bo_objective(self, params):
+        """
+        BO의 목적 함수(Black-box function). 
+        주어진 Theta 파라미터로 FL 시뮬레이션을 실행하고 최종 정확도를 반환합니다.
+        """
+        theta1, theta0 = params
+        # print(f"\n[BO Iteration] Evaluating Theta1={theta1:.4f}, Theta0={theta0:.4f}")
+
+        # 1. 환경 리셋 (매우 중요)
+        # 이전 반복에서 학습된 모델 가중치를 초기화하여 공정한 평가 보장
+        # self.model.load_state_dict(self.initial_model_state)
+        self.model.load_state_dict(self.public_model_params, strict=False)
+        
+        # 2. 클라이언트 파라미터 업데이트
+        # 모든 클라이언트가 새로운 Theta를 사용하여 Beta를 다시 계산하도록 함
+        # h_hat = self.entropy[self.client_id]
+        h_avg = np.mean(self.entropy)
+        # print(f"h_avg: {h_avg}")
+
+
+        self.beta = calculate_interpolation_weight(h_avg, theta1, theta0)
+        # print(f"\n[BO Iteration] Evaluating beta={self.beta}")
+
+        # 3. FL 시뮬레이션 실행
+        metrics = Metrics()
+        self.model.to(self.device)
+        self.model.eval()
+        for x, y in self.testloader:
+            x, y = x.to(self.device), y.to(self.device)
+            logits = self.model(x)
+            # loss = self.calculate_loss(logits, y)
+            loss_base = self.criterion(logits, y)
+            loss_imb = self.criterion_imb(logits, y)
+            loss = self.bete * loss_base + (1-self.beta) * loss_imb
+            pred = torch.argmax(logits, -1)
+            metrics.update(Metrics(loss, pred, y))
+
+        # print(f"[BO Iteration] Result: Loss={metrics.loss.item():.4f}%\n")
+        
+        # 4. 목적 값 반환 (gp_minimize는 최소화하므로 '음수 정확도' 반환)
+        return metrics.loss.item()
                 
     def _verify_aligo_configuration(self):
         """ALI-GO 관련 설정 상태를 확인하고 로깅합니다. (Algorithm 1, Prerequisite 검증)"""
@@ -222,13 +341,13 @@ class FedAvgServer:
             print("="*40)
             print("ELFS with ALI-GO is ENABLED")
             
-            theta1 = self.args.aligo.aligo_theta1
-            theta0 = self.args.aligo.aligo_theta0
+            self.theta1 = self.args.aligo.aligo_theta1
+            self.theta0 = self.args.aligo.aligo_theta0
             
-            if theta1 is not None and theta0 is not None:
+            if self.theta1 is not None and self.theta0 is not None:
                 print(f"Optimized Parameters (Theta* from BO):")
-                print(f"  Theta1 (Steepness): {theta1}")
-                print(f"  Theta0 (Bias): {theta0}")
+                print(f"  Theta1 (Steepness): {self.theta1}")
+                print(f"  Theta0 (Bias): {self.theta0}")
             else:
                 # 파라미터 누락 시 에러 발생
                 error_msg = "ERROR: ALI-GO enabled but optimized parameters missing. "
@@ -506,6 +625,10 @@ class FedAvgServer:
                 self.logger.log("-" * 28, f"TRAINING EPOCH: {E + 1}", "-" * 28)
 
             self.selected_clients = self.client_sample_stream[E]
+
+            # self.theta1, self.theta0 = self.run_bayesian_optimization()
+            # print(f"[epoch {E}] theta 1={self.theta1}, 0={self.theta0}")
+
             begin = time.time()
             self.train_one_round()
             end = time.time()
@@ -567,6 +690,8 @@ class FedAvgServer:
             optimizer_state=self.client_optimizer_states[client_id],
             lr_scheduler_state=self.client_lr_scheduler_states[client_id],
             return_diff=self.return_diff,
+            theta1=self.theta1,
+            theta0=self.theta0,
         )
 
     def test_client_models(self):
