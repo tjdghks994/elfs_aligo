@@ -9,7 +9,7 @@ dataset:
   # [mnist, cifar10, cifar100, emnist, fmnist, femnist, medmnist,
   # medmnistA, medmnistC, covid19, celeba, synthetic, svhn,
   # tiny_imagenet, cinic10, domain]
-  name: cifar10
+  name: cifar100
 
 model:
   name: lenet5 # [lenet5, res18]
@@ -146,10 +146,10 @@ pfedsim:
   warmup_round: 0.5
 
 aligo:
-  use_aligo: true
-  algo: prob # [aligo, elfs, tripod, prob]
-  loss: bs # [focal, dice, ldam, bs] bs == Balanced Softmax
-  aligo_theta1: 6.0
-  aligo_theta0: -3.6
+  use_aligo: true # [true, false]
+  algo: elfs # [aligo, elfs, tripod, prob]
+  loss: focal # [focal, dice, ldam, bs] bs == Balanced Softmax
+  aligo_theta1: 38.0
+  aligo_theta0: -13.7
   focal_gamma: 5.0
-  elfs_threshold: 0.6
+  elfs_threshold: 0.3
