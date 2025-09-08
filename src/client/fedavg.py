@@ -147,6 +147,9 @@ class FedAvgClient:
             # for LDAM Loss, Balanced Softmax
             self.cls_num_list.append(np.bincount(all_labels, minlength=len(self.dataset.classes)))
 
+        h_avg = np.mean(self.entropy)
+        print(f"entropy_avg = {h_avg}")
+
         # print(self.entropy)
         print(f"CE {len([e for e in self.entropy if e >= self.args.aligo.elfs_threshold])}")
         print(f"FO {len([e for e in self.entropy if e < self.args.aligo.elfs_threshold])}")
