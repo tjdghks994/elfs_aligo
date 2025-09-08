@@ -92,10 +92,21 @@ class FedAvgClient:
         self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
         # --- ELFS with ALI-GO 초기화 시작 ---
-        self.beta = 1.0 # 기본 보간 가중치 (L_Base만 사용)
+        self.use_aligo = self.args.aligo.use_aligo
+        self.beta = 1.0
+        self.normalized_entropy = None
+        self.cls_num_list_current = None # 현재 클라이언트 정보만 저장
+        self.criterion_imb = None
+        self.theta1 = self.args.aligo.aligo_theta1  # ALI-GO 최적화된 파라미터 (서버에서 설정됨)
+        self.theta0 = self.args.aligo.aligo_theta0  # ALI-GO 최적화된 파라미터 (서버에서 설정됨)
+        self.focal_gamma = self.args.aligo.focal_gamma  # Focal Loss 감마 파라미터
+        self.entropy = None
 
-        if self.args.aligo.use_aligo:
-            self._initialize_aligo()
+        # old version
+        # self.beta = 1.0 # 기본 보간 가중치 (L_Base만 사용)
+
+        # if self.args.aligo.use_aligo:
+        #     self._initialize_aligo()
 
         # --- ELFS with ALI-GO 초기화 끝 ---
 
@@ -103,133 +114,203 @@ class FedAvgClient:
 
         self.return_diff = return_diff
 
-    def _initialize_aligo(self):
-        # 1. L_Imb 초기화 (Focal Loss 예시, args를 통해 gamma 설정 가능)
-        if self.args.aligo.loss == "focal":
-            gamma = self.args.aligo.focal_gamma
-            self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
-        elif self.args.aligo.loss == "dice":
-            self.criterion_imb = DiceLoss().to(self.device)
-        
-        # 2. 최적화된 파라미터(Theta*) 로드 (Algorithm 1, Prerequisite)
-        # 서버 설정을 통해 args로 전달됨
-        self.theta1 = self.args.aligo.aligo_theta1
-        self.theta0 = self.args.aligo.aligo_theta0
-
-        if self.theta1 is None or self.theta0 is None:
-            raise ValueError(f"Client {self.client_id}: ALI-GO enabled but theta parameters (aligo_theta1/0) are missing in args.")
-
-        # 초기 모델 상태 저장 (BO 시뮬레이션 재시작을 위함 - 매우 중요)
-        self.initial_model_state = deepcopy(self.model.state_dict())
-
-        # set theta1, theta0
-        # self.run_bayesian_optimization()
-        # print(f"Client {self.client_id} BO Result: Theta1={self.theta1}, Theta0={self.theta0}")
-
-        # set beta for ALI-GO
-        # 3. 로컬 엔트로피 계산 (Algorithm 1, Line 15-16)
-        if not self.dataset.classes:
-            raise ValueError("ALI-GO requires 'classes' in dataset.")
-        
-        self.entropy = list()
-        self.cls_num_list = list()
-
-        for idx in range(len(self.data_indices)):
-            all_labels = self._get_all_labels_robust(idx)
-            normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
-            # print(f"client id: {self.client_id}, H_i: {normalized_entropy}")
-
-            # 4. 보간 가중치 계산 (Algorithm 1, Line 18)
-            # Theta와 Entropy가 고정값이므로 Beta도 한 번만 계산하여 최적화
-            
-            self.entropy.append(normalized_entropy)
-
-            # for LDAM Loss, Balanced Softmax
-            self.cls_num_list.append(np.bincount(all_labels, minlength=len(self.dataset.classes)))
-
-        h_avg = np.mean(self.entropy)
-        print(f"entropy_avg = {h_avg}")
-
-        # print(self.entropy)
-        print(f"CE {len([e for e in self.entropy if e >= self.args.aligo.elfs_threshold])}")
-        print(f"FO {len([e for e in self.entropy if e < self.args.aligo.elfs_threshold])}")
-
-
-    def _get_all_labels_robust(self, idx):
-        """데이터 로더의 데이터셋에서 모든 레이블을 효율적이고 안정적으로 추출합니다."""
-        # dataset = self.trainloader.dataset
-        
-        # 효율적인 접근 시도 (데이터셋 구현체에 따라 다름)
-        # print(f"trainset: {self.trainloader.dataset}")
-        # if hasattr(self.trainloader.dataset.dataset, 'targets') or hasattr(self.valloader.dataset.dataset, 'targets'):
-        #     labels = self.trainloader.dataset.dataset.targets + self.valloader.dataset.dataset.targets
-        # else:
-        #     # 폴백: 데이터 로더 순회 (느릴 수 있음)
-        #     print(f"Warning: Iterating DataLoader for Client {self.client_id} to get labels.")
-
-        self.trainset.indices = self.data_indices[idx]["train"]
-        self.valset.indices = self.data_indices[idx]["val"]
-        self.testset.indices = self.data_indices[idx]["test"]
-
+    def _get_current_labels_optimized(self):
         labels = []
-        for _, target in self.trainloader:
-            labels.extend(target.cpu().tolist())
-        for _, target in self.valloader:
-            labels.extend(target.cpu().tolist())
-        
+        for loader in [self.trainloader, self.valloader]:
+             for _, target in loader:
+                 labels.extend(target.cpu().tolist())
         return np.array(labels)
     
+    def _prepare_aligo_for_training(self):
+        """현재 클라이언트에 대한 엔트로피, 베타 계산 및 손실 초기화."""
+        # 1. 레이블 수집 및 통계 계산
+        all_labels = self._get_current_labels_optimized()
+        num_classes = len(self.dataset.classes)
+        self.normalized_entropy = calculate_normalized_entropy(all_labels, num_classes)
+        self.cls_num_list_current = np.bincount(all_labels, minlength=num_classes)
+        # print(f"Client {self.client_id}: H_i = {self.normalized_entropy}, Class counts = {self.cls_num_list_current}")
+
+        # 2. L_Imb 초기화 (손실 함수 재초기화 문제 해결)
+        # (Focal, Dice, LDAM, BS 등을 여기서 초기화합니다. Tripod 등 복합 알고리즘도 여기서 필요한 모든 손실을 초기화해야 합니다.)
+        loss_type = self.args.aligo.loss
+        if loss_type == "focal":
+            self.criterion_imb = FocalLoss(gamma=self.focal_gamma).to(self.device)
+        elif loss_type == "dice":
+            self.criterion_imb = DiceLoss().to(self.device)
+        elif self.args.aligo.loss == "ldam":
+            cnl = self.cls_num_list_current
+            self.criterion_imb = LDAMLoss(cls_num_list=cnl).to(self.device)
+        elif self.args.aligo.loss == "bs":
+            cnl = self.cls_num_list_current
+            self.criterion_imb = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
+        else:
+            raise ValueError(f"Unsupported imbalance loss type: {loss_type}")
+
+        # 3. Beta 계산 (ALI-GO)
+        if self.args.aligo.algo == "aligo" and self.theta1 is not None:
+            self.beta = calculate_interpolation_weight(self.normalized_entropy, self.theta1, self.theta0)
 
     def calculate_loss(self, outputs, targets):
-        """
-        손실을 계산합니다. (Algorithm 1, Line 20)
-        이 메소드는 FedProx와 같은 다른 알고리즘에서 super()로 호출되어 쉽게 확장될 수 있습니다.
-        """
-        if self.args.aligo.algo == "aligo" and self.args.aligo.use_aligo:
-            # Adaptive Loss Interpolation (ALI)
+        # 인스턴스 변수(self.beta, self.normalized_entropy)를 사용하도록 수정
+        if not self.use_aligo:
+            return self.criterion(outputs, targets)
 
-            # L_i = beta * L_Base + (1 - beta) * L_Imb
-            # beta = self.entropy[self.client_id]["beta"]
+        algo = self.args.aligo.algo
+        if algo == "aligo":
+            # ... (self.beta 사용) ...
             loss_base = self.criterion(outputs, targets)
             loss_imb = self.criterion_imb(outputs, targets)
-            loss = self.beta * loss_base + (1-self.beta) * loss_imb
-            # loss = self.entropy[self.client_id] * loss_base + (1-self.entropy[self.client_id]) * loss_imb
-        elif self.args.aligo.algo == "elfs" and self.args.aligo.use_aligo:
-            if self.entropy[self.client_id] >= self.args.aligo.elfs_threshold:
-                # print(f"[id {self.client_id}] use CE because h_hat {self.entropy[self.client_id]}")
-                # Cross Entropy
-                loss = self.criterion(outputs, targets)
+            loss = self.beta * loss_base + (1 - self.beta) * loss_imb
+        elif algo == "elfs":
+            # ... (self.normalized_entropy 사용) ...
+            if self.normalized_entropy >= self.args.aligo.elfs_threshold:
+                 loss = self.criterion(outputs, targets)
             else:
-                # Focal Loss
-                # print(f"[id {self.client_id}] use FO  because h_hat {self.entropy[self.client_id]}")
-                loss = self.criterion_imb(outputs, targets)
-        elif self.args.aligo.algo == "tripod" and self.args.aligo.use_aligo:
-            if self.entropy[self.client_id] > 0.6:
+                 loss = self.criterion_imb(outputs, targets)
+        elif self.args.aligo.algo == "tripod":
+            if self.normalized_entropy > 0.6:
                 # print(f"[id {self.client_id}] use CE because h_hat {self.entropy[self.client_id]}")
                 # Cross Entropy
                 loss = self.criterion(outputs, targets)
-            elif 0.3 < self.entropy[self.client_id] <= 0.6:
+            elif 0.3 < self.normalized_entropy <= 0.6:
                 # Balanced Softmaxloss
-                cnl = self.cls_num_list[self.client_id]
-                self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
+                self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=self.cls_num_list).to(self.device)
                 loss = self.criterion_bs(outputs, targets)
             else:
                 # Focal Loss
                 # print(f"[id {self.client_id}] use FO  because h_hat {self.entropy[self.client_id]}")
                 loss = self.criterion_imb(outputs, targets)
-        elif self.args.aligo.algo == "prob" and self.args.aligo.use_aligo:
-            h_avg = np.mean(self.entropy)
-            if torch.rand(1).item() < h_avg:
-                loss = self.criterion(outputs, targets)
-            else:
-                cnl = self.cls_num_list[self.client_id]
-                self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
-                loss = self.criterion_bs(outputs, targets)
         else:
-            # 표준 FedAvg 손실
-            loss = self.criterion(outputs, targets)
-            
+            raise ValueError(f"Unsupported ALI-GO algorithm: {algo}")
+        
         return loss
+    
+    # def _initialize_aligo(self):
+    #     # 1. L_Imb 초기화 (Focal Loss 예시, args를 통해 gamma 설정 가능)
+    #     if self.args.aligo.loss == "focal":
+    #         gamma = self.args.aligo.focal_gamma
+    #         self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
+    #     elif self.args.aligo.loss == "dice":
+    #         self.criterion_imb = DiceLoss().to(self.device)
+        
+    #     # 2. 최적화된 파라미터(Theta*) 로드 (Algorithm 1, Prerequisite)
+    #     # 서버 설정을 통해 args로 전달됨
+    #     self.theta1 = self.args.aligo.aligo_theta1
+    #     self.theta0 = self.args.aligo.aligo_theta0
+
+    #     if self.theta1 is None or self.theta0 is None:
+    #         raise ValueError(f"Client {self.client_id}: ALI-GO enabled but theta parameters (aligo_theta1/0) are missing in args.")
+
+    #     # 초기 모델 상태 저장 (BO 시뮬레이션 재시작을 위함 - 매우 중요)
+    #     self.initial_model_state = deepcopy(self.model.state_dict())
+
+    #     # set theta1, theta0
+    #     # self.run_bayesian_optimization()
+    #     # print(f"Client {self.client_id} BO Result: Theta1={self.theta1}, Theta0={self.theta0}")
+
+    #     # set beta for ALI-GO
+    #     # 3. 로컬 엔트로피 계산 (Algorithm 1, Line 15-16)
+    #     if not self.dataset.classes:
+    #         raise ValueError("ALI-GO requires 'classes' in dataset.")
+        
+    #     self.entropy = list()
+    #     self.cls_num_list = list()
+
+    #     for idx in range(len(self.data_indices)):
+    #         all_labels = self._get_all_labels_robust(idx)
+    #         normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
+    #         # print(f"client id: {self.client_id}, H_i: {normalized_entropy}")
+
+    #         # 4. 보간 가중치 계산 (Algorithm 1, Line 18)
+    #         # Theta와 Entropy가 고정값이므로 Beta도 한 번만 계산하여 최적화
+            
+    #         self.entropy.append(normalized_entropy)
+
+    #         # for LDAM Loss, Balanced Softmax
+    #         self.cls_num_list.append(np.bincount(all_labels, minlength=len(self.dataset.classes)))
+
+    #     h_avg = np.mean(self.entropy)
+    #     print(f"entropy_avg = {h_avg}")
+
+    #     # print(self.entropy)
+    #     print(f"CE {len([e for e in self.entropy if e >= self.args.aligo.elfs_threshold])}")
+    #     print(f"FO {len([e for e in self.entropy if e < self.args.aligo.elfs_threshold])}")
+
+
+    # def _get_all_labels_robust(self, idx):
+    #     """데이터 로더의 데이터셋에서 모든 레이블을 효율적이고 안정적으로 추출합니다."""
+    #     # dataset = self.trainloader.dataset
+        
+    #     # 효율적인 접근 시도 (데이터셋 구현체에 따라 다름)
+    #     # print(f"trainset: {self.trainloader.dataset}")
+    #     # if hasattr(self.trainloader.dataset.dataset, 'targets') or hasattr(self.valloader.dataset.dataset, 'targets'):
+    #     #     labels = self.trainloader.dataset.dataset.targets + self.valloader.dataset.dataset.targets
+    #     # else:
+    #     #     # 폴백: 데이터 로더 순회 (느릴 수 있음)
+    #     #     print(f"Warning: Iterating DataLoader for Client {self.client_id} to get labels.")
+
+    #     self.trainset.indices = self.data_indices[idx]["train"]
+    #     self.valset.indices = self.data_indices[idx]["val"]
+    #     self.testset.indices = self.data_indices[idx]["test"]
+
+    #     labels = []
+    #     for _, target in self.trainloader:
+    #         labels.extend(target.cpu().tolist())
+    #     for _, target in self.valloader:
+    #         labels.extend(target.cpu().tolist())
+        
+    #     return np.array(labels)
+
+    # def calculate_loss(self, outputs, targets):
+    #     """
+    #     손실을 계산합니다. (Algorithm 1, Line 20)
+    #     이 메소드는 FedProx와 같은 다른 알고리즘에서 super()로 호출되어 쉽게 확장될 수 있습니다.
+    #     """        
+    #     if self.args.aligo.algo == "aligo" and self.args.aligo.use_aligo:
+    #         # Adaptive Loss Interpolation (ALI)
+
+    #         # L_i = beta * L_Base + (1 - beta) * L_Imb
+    #         # beta = self.entropy[self.client_id]["beta"]
+    #         loss_base = self.criterion(outputs, targets)
+    #         loss_imb = self.criterion_imb(outputs, targets)
+    #         loss = self.beta * loss_base + (1-self.beta) * loss_imb
+    #         # loss = self.entropy[self.client_id] * loss_base + (1-self.entropy[self.client_id]) * loss_imb
+    #     elif self.args.aligo.algo == "elfs" and self.args.aligo.use_aligo:
+    #         if self.entropy[self.client_id] >= self.args.aligo.elfs_threshold:
+    #             # print(f"[id {self.client_id}] use CE because h_hat {self.entropy[self.client_id]}")
+    #             # Cross Entropy
+    #             loss = self.criterion(outputs, targets)
+    #         else:
+    #             # Focal Loss
+    #             # print(f"[id {self.client_id}] use FO  because h_hat {self.entropy[self.client_id]}")
+    #             loss = self.criterion_imb(outputs, targets)
+    #     elif self.args.aligo.algo == "tripod" and self.args.aligo.use_aligo:
+    #         if self.entropy[self.client_id] > 0.6:
+    #             # print(f"[id {self.client_id}] use CE because h_hat {self.entropy[self.client_id]}")
+    #             # Cross Entropy
+    #             loss = self.criterion(outputs, targets)
+    #         elif 0.3 < self.entropy[self.client_id] <= 0.6:
+    #             # Balanced Softmaxloss
+    #             cnl = self.cls_num_list[self.client_id]
+    #             self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
+    #             loss = self.criterion_bs(outputs, targets)
+    #         else:
+    #             # Focal Loss
+    #             # print(f"[id {self.client_id}] use FO  because h_hat {self.entropy[self.client_id]}")
+    #             loss = self.criterion_imb(outputs, targets)
+    #     elif self.args.aligo.algo == "prob" and self.args.aligo.use_aligo:
+    #         h_avg = np.mean(self.entropy)
+    #         if torch.rand(1).item() < h_avg:
+    #             loss = self.criterion(outputs, targets)
+    #         else:
+    #             cnl = self.cls_num_list[self.client_id]
+    #             self.criterion_bs = BalancedSoftmaxLoss(cls_num_list=cnl).to(self.device)
+    #             loss = self.criterion_bs(outputs, targets)
+    #     else:
+    #         # 표준 FedAvg 손실
+    #         loss = self.criterion(outputs, targets)
+            
+    #     return loss
 
     def load_data_indices(self):
         """This function is for loading data indices for No.`self.client_id`
@@ -256,12 +337,12 @@ class FedAvgClient:
         }
         eval_results["before"] = self.evaluate()
 
-        if self.args.aligo.use_aligo:
-            h_hat = self.entropy[self.client_id]
+        if self.use_aligo:
+            h_hat = self.normalized_entropy
             self.beta = calculate_interpolation_weight(h_hat, self.theta1, self.theta0)
         
             # for LDAM, Balanced Softmax
-            cnl = self.cls_num_list[self.client_id]
+            cnl = self.cls_num_list_current
             if self.args.aligo.loss == "ldam":
                 self.criterion_imb = LDAMLoss(cls_num_list=cnl).to(self.device)
             elif self.args.aligo.loss == "bs":
@@ -294,7 +375,14 @@ class FedAvgClient:
         self.local_epoch = package["local_epoch"]
         self.load_data_indices()
 
-        self.theta1, self.theta0 = package["theta1"], package["theta0"]
+        if self.args.aligo.use_aligo:
+            # 서버로부터 Theta 수신
+            self.theta1, self.theta0 = package["theta1"], package["theta0"]
+            self.focal_gamma = package["focal_gamma"]
+            # 현재 클라이언트 데이터 기반으로 ALI-GO 준비
+            self._prepare_aligo_for_training()
+
+        # self.theta1, self.theta0 = package["theta1"], package["theta0"]
 
         if (
             package["optimizer_state"]

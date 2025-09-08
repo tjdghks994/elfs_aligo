@@ -101,7 +101,10 @@ DEFAULTS = {
       "aligo_theta1": 1.0,
       "aligo_theta0": 0.0,
       "focal_gamma": 2.0,
-      "elfs_threshold": 0.9, # [0, 1] normalized threshold
+      "elfs_threshold": 0.2, # [0, 1] normalized threshold
+      "use_bo": False,
+      "bo_n_calls": 20,
+      "bo_simulation_rounds": 50,
     }
 }
 

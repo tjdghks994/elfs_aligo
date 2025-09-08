@@ -196,8 +196,7 @@ class FedAvgServer:
         self.client_data_indices = self.get_clients_data_indices()
 
         # --- ELFS with ALI-GO 설정 확인 ---
-        self.theta1 = self.args.aligo.aligo_theta1
-        self.theta0 = self.args.aligo.aligo_theta0
+        self.initial_public_model_params = deepcopy(self.public_model_params)
 
         self._verify_aligo_configuration()
 
@@ -217,8 +216,8 @@ class FedAvgServer:
 
         self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
-        gamma = self.args.aligo.focal_gamma
-        self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
+        # gamma = self.args.aligo.focal_gamma
+        # self.criterion_imb = FocalLoss(gamma=gamma).to(self.device)
 
         (self.trainloader,
          self.testloader,
@@ -256,82 +255,78 @@ class FedAvgServer:
                 )
         
     def run_bayesian_optimization(self):
-        """BO를 실행하여 최적의 Theta1, Theta0를 찾고 self.args에 저장합니다."""
+        if gp_minimize is None:
+             raise ImportError("scikit-optimize is required for BO.")
         
-        # 1. 탐색 공간 정의 (Section III.D 기반)
-        # Theta1 (Steepness): >= 0 (단조성 보장). 값이 클수록 이진 스위칭에 가까워짐.
-        # Theta0 (Bias): Inflection point(-theta0/theta1)를 결정.
-        # 범위는 실험 환경에 따라 조정될 수 있습니다. (예: T1=[0, 20], T0=[-10, 10])
+        # ... (Space 정의 및 n_calls 설정) ...
         space = [
             Real(0.0, 20.0, name="theta1"),
-            Real(-10.0, 10.0, name="theta0")
+            Real(-10.0, 10.0, name="theta0"),
+            Real(2.0, 6.0, name="focal_gamma")
         ]
+        n_calls = self.args.aligo.bo_n_calls # < 10
+        self.bo_simulation_rounds = self.args.aligo.bo_simulation_rounds 
 
-        # 2. BO 파라미터 설정 (args를 통해 제어)
-        # aligo_bo_n_calls: 총 평가 횟수 (초기 랜덤 샘플링 포함)
-        n_calls = getattr(self.args, "aligo_bo_n_calls", 50) 
-        # aligo_bo_rounds: 각 평가 시 실행할 FL 시뮬레이션 라운드 수 (효율성을 위해 메인보다 짧게 설정)
-        # self.bo_rounds = getattr(self.args, "aligo_bo_rounds", 5)
-
-        # print(f"BO Config: n_calls={n_calls}, simulation_rounds={self.bo_rounds}")
-
-        # 3. 최적화 실행 (gp_minimize는 목적 함수의 최소값을 찾음)
         result = gp_minimize(
             func=self._bo_objective,
             dimensions=space,
             n_calls=n_calls,
-            # 재현성을 위한 랜덤 시드 설정
             random_state=self.args.common.seed,
-        ) # type: ignore
-
-        # 4. 결과 저장
-        # print(f"[BO result] {result}")
-        return result.x
-        # self.theta1 = result.x[0]
-        # self.theta0 = result.x[1]
-        # print(f"[{self.client_id}] theta1: {self.theta1}, theta0: {self.theta0}")
+        )
+        
+        self.theta1, self.theta0, self.focal_gamma = result.x
+        self.logger.log(f"[BO Completed] Optimal Theta1={self.theta1:.4f}, Theta0={self.theta0:.4f}, Focal Gamma={self.focal_gamma:.4f}")
 
     def _bo_objective(self, params):
-        """
-        BO의 목적 함수(Black-box function). 
-        주어진 Theta 파라미터로 FL 시뮬레이션을 실행하고 최종 정확도를 반환합니다.
-        """
-        theta1, theta0 = params
-        # print(f"\n[BO Iteration] Evaluating Theta1={theta1:.4f}, Theta0={theta0:.4f}")
+        """BO 목적 함수: FL 시뮬레이션 실행 및 검증 정확도 반환."""
+        theta1, theta0, focal_gamma = params
+        self.logger.log(f"[BO Iteration] Evaluating Theta1={theta1:.4f}, Theta0={theta0:.4f}, Focal Gamma={focal_gamma:.4f}")
 
-        # 1. 환경 리셋 (매우 중요)
-        # 이전 반복에서 학습된 모델 가중치를 초기화하여 공정한 평가 보장
-        # self.model.load_state_dict(self.initial_model_state)
+        # 1. 환경 리셋 (초기 모델 상태로 복원)
+        self.public_model_params = deepcopy(self.initial_public_model_params)
         self.model.load_state_dict(self.public_model_params, strict=False)
         
-        # 2. 클라이언트 파라미터 업데이트
-        # 모든 클라이언트가 새로운 Theta를 사용하여 Beta를 다시 계산하도록 함
-        # h_hat = self.entropy[self.client_id]
-        h_avg = np.mean(self.entropy)
-        # print(f"h_avg: {h_avg}")
-
-
-        self.beta = calculate_interpolation_weight(h_avg, theta1, theta0)
-        # print(f"\n[BO Iteration] Evaluating beta={self.beta}")
+        # 2. 현재 평가 중인 Theta 설정 (package 함수를 통해 클라이언트에게 전파됨)
+        self.theta1 = theta1
+        self.theta0 = theta0
+        self.focal_gamma = focal_gamma
 
         # 3. FL 시뮬레이션 실행
-        metrics = Metrics()
-        self.model.to(self.device)
-        self.model.eval()
-        for x, y in self.testloader:
-            x, y = x.to(self.device), y.to(self.device)
-            logits = self.model(x)
-            # loss = self.calculate_loss(logits, y)
-            loss_base = self.criterion(logits, y)
-            loss_imb = self.criterion_imb(logits, y)
-            loss = self.bete * loss_base + (1-self.beta) * loss_imb
-            pred = torch.argmax(logits, -1)
-            metrics.update(Metrics(loss, pred, y))
+        for E in range(self.bo_simulation_rounds):
+            # 클라이언트 샘플링 (메인 스트림 사용 또는 랜덤 샘플링)
+            # self.logger.log(f"[BO Iteration] Round {E+1}/{self.bo_simulation_rounds}")
+            if E < len(self.client_sample_stream):
+                 self.selected_clients = self.client_sample_stream[E]
+            else:
+                # 샘플 스트림이 부족할 경우 랜덤 샘플링
+                self.selected_clients = random.sample(
+                    self.train_clients,
+                    max(1, int(self.client_num * self.args.common.join_ratio)),
+                )
+            
+            # 한 라운드 실행 (클라이언트 훈련 + 집계)
+            self.train_one_round()
 
-        # print(f"[BO Iteration] Result: Loss={metrics.loss.item():.4f}%\n")
-        
-        # 4. 목적 값 반환 (gp_minimize는 최소화하므로 '음수 정확도' 반환)
-        return metrics.loss.item()
+        # 4. 검증 정확도 평가 (Validation Accuracy)
+        if len(self.valset) > 0:
+             loader = self.valloader
+        else:
+             self.logger.warn("Validation set is empty. Using test set for BO. This is risky.")
+             loader = self.testloader
+
+        # 평가 시에는 표준 Cross-Entropy 사용
+        criterion = torch.nn.CrossEntropyLoss(reduction="sum") 
+        metrics = evaluate_model(
+            model=self.model,
+            dataloader=loader,
+            criterion=criterion,
+            device=self.device,
+        )
+        accuracy = metrics.accuracy
+        self.logger.log(f"[BO Iteration] Result: Accuracy={accuracy:.4f}")
+
+        # 5. 목적 값 반환 (최소화를 위해 음수 정확도 반환)
+        return -accuracy
                 
     def _verify_aligo_configuration(self):
         """ALI-GO 관련 설정 상태를 확인하고 로깅합니다. (Algorithm 1, Prerequisite 검증)"""
@@ -343,11 +338,13 @@ class FedAvgServer:
             
             self.theta1 = self.args.aligo.aligo_theta1
             self.theta0 = self.args.aligo.aligo_theta0
+            self.focal_gamma = self.args.aligo.focal_gamma
             
             if self.theta1 is not None and self.theta0 is not None:
                 print(f"Optimized Parameters (Theta* from BO):")
                 print(f"  Theta1 (Steepness): {self.theta1}")
                 print(f"  Theta0 (Bias): {self.theta0}")
+                print(f"  Focal Gamma: {self.focal_gamma}")
             else:
                 # 파라미터 누락 시 에러 발생
                 error_msg = "ERROR: ALI-GO enabled but optimized parameters missing. "
@@ -692,6 +689,7 @@ class FedAvgServer:
             return_diff=self.return_diff,
             theta1=self.theta1,
             theta0=self.theta0,
+            focal_gamma=self.focal_gamma,
         )
 
     def test_client_models(self):
@@ -1108,6 +1106,19 @@ class FedAvgServer:
                 f"ExperimentalArguments-{self.monitor_window_name_suffix}",
                 f"{json.dumps(OmegaConf.to_object(self.args), indent=4)}",
             )
+
+        # --- Prerequisite: Bayesian Optimization ---
+        # BO 사용 여부 확인 (args.aligo.use_bo 플래그가 필요하다고 가정)
+        self.use_bo = self.args.aligo.use_bo
+        if self.args.aligo.use_aligo and self.use_bo:
+            self.logger.log("--- Starting ALI-GO Bayesian Optimization (Prerequisite Phase) ---")
+            self.run_bayesian_optimization()
+            self.logger.log(f"BO Finished. Optimal Theta*: Theta1={self.theta1:.4f}, Theta0={self.theta0:.4f}")
+            
+            # 메인 학습을 위해 모델을 초기 상태로 복원
+            self.public_model_params = deepcopy(self.initial_public_model_params)
+            self.model.load_state_dict(self.public_model_params, strict=False)
+        # -------------------------------------------
 
         begin = time.time()
         try:

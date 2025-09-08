@@ -12,7 +12,7 @@ dataset:
   name: cifar10
 
 model:
-  name: res18 # [lenet5, res18]
+  name: lenet5 # [lenet5, res18]
 
   # Whether to use torchvision integrated model weights.
   # Has no effect if model is lenet5, 2nn or fedavgcnn
@@ -149,7 +149,10 @@ aligo:
   use_aligo: true # [true, false]
   algo: aligo # [aligo, elfs, tripod, prob]
   loss: focal # [focal, dice, ldam, bs] bs == Balanced Softmax
-  aligo_theta1: 38.0
-  aligo_theta0: -13.7
-  focal_gamma: 5.0
+  aligo_theta1: 12.3496
+  aligo_theta0: 2.2331
+  focal_gamma: 2.0283
   elfs_threshold: 0.3
+  use_bo: true # Whether to use Bayesian Optimization to optimize theta1 and theta0
+  bo_n_calls: 20 # Number of initial rounds for Bayesian Optimization
+  bo_simulation_rounds: 50 # Number of rounds for each FL simulation during Bayesian
