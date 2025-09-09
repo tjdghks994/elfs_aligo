@@ -3,7 +3,7 @@
 # the defaults can be found in src/utils/constants.py
 
 # The method name must be identical to the file name in src/server/<method>.py
-method: fedavg
+method: fedavg # [fedavg, fedprox, pFedMe, fednova, scaffold, pFedSim, fedrep, ditto, fedper]
 
 dataset:
   # [mnist, cifar10, cifar100, emnist, fmnist, femnist, medmnist,
@@ -147,12 +147,12 @@ pfedsim:
 
 aligo:
   use_aligo: true # [true, false]
-  algo: aligo # [aligo, elfs, tripod, prob]
-  loss: focal # [focal, dice, ldam, bs] bs == Balanced Softmax
+  algo: elfs # [aligo, elfs, tripod, prob]
+  loss: bs # [focal, dice, ldam, bs] bs == Balanced Softmax
   aligo_theta1: 12.3496
   aligo_theta0: 2.2331
   focal_gamma: 2.0283
   elfs_threshold: 0.3
-  use_bo: true # Whether to use Bayesian Optimization to optimize theta1 and theta0
-  bo_n_calls: 20 # Number of initial rounds for Bayesian Optimization
-  bo_simulation_rounds: 50 # Number of rounds for each FL simulation during Bayesian
+  use_bo: true # Whether to use Bayesian Optimization to optimize hyperparameters.
+  bo_n_calls: 30 # Number of initial rounds for Bayesian Optimization. should be >= 10.
+  bo_simulation_rounds: 50 # Number of rounds for each FL simulation during Bayesian Optimization.

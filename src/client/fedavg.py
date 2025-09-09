@@ -100,8 +100,9 @@ class FedAvgClient:
         self.theta1 = self.args.aligo.aligo_theta1  # ALI-GO 최적화된 파라미터 (서버에서 설정됨)
         self.theta0 = self.args.aligo.aligo_theta0  # ALI-GO 최적화된 파라미터 (서버에서 설정됨)
         self.focal_gamma = self.args.aligo.focal_gamma  # Focal Loss 감마 파라미터
+        self.elfs_threshold = self.args.aligo.elfs_threshold  # ELFS 임계값
         self.entropy = None
-
+        
         # old version
         # self.beta = 1.0 # 기본 보간 가중치 (L_Base만 사용)
 
@@ -163,7 +164,7 @@ class FedAvgClient:
             loss = self.beta * loss_base + (1 - self.beta) * loss_imb
         elif algo == "elfs":
             # ... (self.normalized_entropy 사용) ...
-            if self.normalized_entropy >= self.args.aligo.elfs_threshold:
+            if self.normalized_entropy >= self.elfs_threshold:
                  loss = self.criterion(outputs, targets)
             else:
                  loss = self.criterion_imb(outputs, targets)
@@ -379,6 +380,7 @@ class FedAvgClient:
             # 서버로부터 Theta 수신
             self.theta1, self.theta0 = package["theta1"], package["theta0"]
             self.focal_gamma = package["focal_gamma"]
+            self.elfs_threshold = package["elfs_threshold"]
             # 현재 클라이언트 데이터 기반으로 ALI-GO 준비
             self._prepare_aligo_for_training()
 

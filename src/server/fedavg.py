@@ -198,21 +198,13 @@ class FedAvgServer:
         # --- ELFS with ALI-GO 설정 확인 ---
         self.initial_public_model_params = deepcopy(self.public_model_params)
 
-        self._verify_aligo_configuration()
-
+        self.theta1 = None
+        self.theta0 = None
+        self.focal_gamma = None
+        self.elfs_threshold = None
         self.entropy = list()
 
-        for data_idx in self.client_data_indices:
-            labels = []
-            for idx in data_idx['train']:
-                labels.append(self.dataset[idx][1].cpu().tolist())
-            for idx in data_idx['val']:
-                labels.append(self.dataset[idx][1].cpu().tolist())
-               
-            all_labels = np.array(labels)
-            normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
-
-            self.entropy.append(normalized_entropy)
+        self._verify_aligo_configuration()
 
         self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
@@ -258,38 +250,81 @@ class FedAvgServer:
         if gp_minimize is None:
              raise ImportError("scikit-optimize is required for BO.")
         
-        # ... (Space 정의 및 n_calls 설정) ...
-        space = [
-            Real(0.0, 20.0, name="theta1"),
-            Real(-10.0, 10.0, name="theta0"),
-            Real(2.0, 6.0, name="focal_gamma")
-        ]
         n_calls = self.args.aligo.bo_n_calls # < 10
         self.bo_simulation_rounds = self.args.aligo.bo_simulation_rounds 
-
-        result = gp_minimize(
+        
+        # ... (Space 정의 및 n_calls 설정) ...
+        if self.args.aligo.algo == "aligo":
+            space = [
+                Real(0.0, 20.0, name="theta1"),
+                Real(-10.0, 10.0, name="theta0"),
+            ]
+            if self.args.aligo.loss == "focal":
+                space.append(Real(2.0, 5.0, name="focal_gamma", prior="log-uniform"))
+            result = gp_minimize(
             func=self._bo_objective,
             dimensions=space,
             n_calls=n_calls,
             random_state=self.args.common.seed,
-        )
-        
-        self.theta1, self.theta0, self.focal_gamma = result.x
-        self.logger.log(f"[BO Completed] Optimal Theta1={self.theta1:.4f}, Theta0={self.theta0:.4f}, Focal Gamma={self.focal_gamma:.4f}")
+            )
+
+            self.theta1, self.theta0 = result.x[:2]
+            if self.args.aligo.loss == "focal":
+                self.focal_gamma = result.x[-1]
+
+            self.logger.log(f"[BO Completed] Optimal Theta1={self.theta1:.4f}, Theta0={self.theta0:.4f}, Focal Gamma={self.focal_gamma:.4f}")
+        elif self.args.aligo.algo == "elfs":
+            space = [
+                Real(0.0, 1.0, name="elfs_threshold"),
+            ]
+            if self.args.aligo.loss == "focal":
+                space.append(Real(2.0, 5.0, name="focal_gamma", prior="log-uniform"))
+            result = gp_minimize(
+            func=self._bo_objective,
+            dimensions=space,
+            n_calls=n_calls,
+            random_state=self.args.common.seed,
+            )
+            
+            self.elfs_threshold = result.x[0]
+            if self.args.aligo.loss == "focal":
+                self.focal_gamma = result.x[-1]
+
+            self.logger.log(f"[BO Completed] Optimal ELFS Threshold={self.elfs_threshold:.4f}, Focal Gamma={self.focal_gamma:.4f}")
+        else:
+            self.logger.log(f"BO is not supported for algo {self.args.aligo.algo}. Skipping BO.")
+            pass
 
     def _bo_objective(self, params):
         """BO 목적 함수: FL 시뮬레이션 실행 및 검증 정확도 반환."""
-        theta1, theta0, focal_gamma = params
-        self.logger.log(f"[BO Iteration] Evaluating Theta1={theta1:.4f}, Theta0={theta0:.4f}, Focal Gamma={focal_gamma:.4f}")
-
         # 1. 환경 리셋 (초기 모델 상태로 복원)
         self.public_model_params = deepcopy(self.initial_public_model_params)
         self.model.load_state_dict(self.public_model_params, strict=False)
         
         # 2. 현재 평가 중인 Theta 설정 (package 함수를 통해 클라이언트에게 전파됨)
-        self.theta1 = theta1
-        self.theta0 = theta0
-        self.focal_gamma = focal_gamma
+        if self.args.aligo.algo == "aligo":
+            theta1, theta0 = params[:2]
+            self.theta1 = theta1
+            self.theta0 = theta0
+
+            if self.args.aligo.loss == "focal":
+                focal_gamma = params[-1]
+                self.focal_gamma = focal_gamma
+            else:
+                self.focal_gamma = 0.0
+
+            self.logger.log(f"[BO Iteration] Evaluating Theta1={self.theta1:.4f}, Theta0={self.theta0:.4f}, Focal Gamma={self.focal_gamma:.4f}")
+        elif self.args.aligo.algo == "elfs":
+            elfs_threshold = params[0]
+            self.elfs_threshold = elfs_threshold
+            
+            if self.args.aligo.loss == "focal":
+                focal_gamma = params[-1]
+                self.focal_gamma = focal_gamma
+            else:
+                self.focal_gamma = 0.0
+
+            self.logger.log(f"[BO Iteration] Evaluating ELFS Threshold={self.elfs_threshold:.4f}, Focal Gamma={self.focal_gamma:.4f}")
 
         # 3. FL 시뮬레이션 실행
         for E in range(self.bo_simulation_rounds):
@@ -339,6 +374,7 @@ class FedAvgServer:
             self.theta1 = self.args.aligo.aligo_theta1
             self.theta0 = self.args.aligo.aligo_theta0
             self.focal_gamma = self.args.aligo.focal_gamma
+            self.elfs_threshold = self.args.aligo.elfs_threshold
             
             if self.theta1 is not None and self.theta0 is not None:
                 print(f"Optimized Parameters (Theta* from BO):")
@@ -351,6 +387,18 @@ class FedAvgServer:
                 error_msg += "Please provide 'aligo_theta1' and 'aligo_theta0' in args."
                 print(error_msg)
                 raise ValueError(error_msg)
+            
+            for data_idx in self.client_data_indices:
+                labels = []
+                for idx in data_idx['train']:
+                    labels.append(self.dataset[idx][1].cpu().tolist())
+                for idx in data_idx['val']:
+                    labels.append(self.dataset[idx][1].cpu().tolist())
+                
+                all_labels = np.array(labels)
+                normalized_entropy = calculate_normalized_entropy(all_labels, len(self.dataset.classes))
+
+                self.entropy.append(normalized_entropy)
                 
             if not self.dataset.classes:
                  print("ERROR: 'num_classes' must be specified for ALI-GO.")
@@ -690,6 +738,7 @@ class FedAvgServer:
             theta1=self.theta1,
             theta0=self.theta0,
             focal_gamma=self.focal_gamma,
+            elfs_threshold=self.elfs_threshold,
         )
 
     def test_client_models(self):
@@ -1113,8 +1162,7 @@ class FedAvgServer:
         if self.args.aligo.use_aligo and self.use_bo:
             self.logger.log("--- Starting ALI-GO Bayesian Optimization (Prerequisite Phase) ---")
             self.run_bayesian_optimization()
-            self.logger.log(f"BO Finished. Optimal Theta*: Theta1={self.theta1:.4f}, Theta0={self.theta0:.4f}")
-            
+
             # 메인 학습을 위해 모델을 초기 상태로 복원
             self.public_model_params = deepcopy(self.initial_public_model_params)
             self.model.load_state_dict(self.public_model_params, strict=False)
